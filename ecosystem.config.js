@@ -99,23 +99,23 @@ module.exports = {
         PYTHONPATH: './backend-fastapi',
         UVICORN_HOST: '0.0.0.0',
         UVICORN_PORT: 8000,
-        AI_BACKEND_PORT: 5052,
+        AI_BACKEND_PORT: 8000,
         LOG_LEVEL: 'debug',
         ERROR_BATCH_SIZE: 50,
         HEALTH_CHECK_INTERVAL_SECONDS: 30,
-        GROQ_MODEL: 'llama-3.1-8b-instant',
-        GOOGLE_MODEL: 'gemini-1.5-flash'
+        GROQ_MODEL: 'llama3-70b-8192',
+        GOOGLE_MODEL: 'gemini-1.5-pro'
       },
       env_production: {
         PYTHONPATH: './backend-fastapi',
         UVICORN_HOST: '0.0.0.0',
         UVICORN_PORT: 8000,
-        AI_BACKEND_PORT: 5052,
+        AI_BACKEND_PORT: 8000,
         LOG_LEVEL: 'info',
         ERROR_BATCH_SIZE: 50,
         HEALTH_CHECK_INTERVAL_SECONDS: 30,
-        GROQ_MODEL: 'llama-3.1-8b-instant',
-        GOOGLE_MODEL: 'gemini-1.5-flash'
+        GROQ_MODEL: 'llama3-70b-8192',
+        GOOGLE_MODEL: 'gemini-1.5-pro'
       }
     },
     

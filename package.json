@@ -21,13 +21,13 @@
     
     "dev:frontend": "cd frontend && npm run dev",
     "dev:backend-node": "cd backend-node && npm run dev",
-    "dev:backend-fastapi": "cd backend-fastapi && uvicorn main:app --host 0.0.0.0 --port 5052 --reload",
+    "dev:backend-fastapi": "cd backend-fastapi && uvicorn main:app --host 0.0.0.0 --port 8000 --reload",
     "dev:backend-service": "cd backend-service && npm start",
     
     "build": "npm run build:frontend",
     "build:frontend": "cd frontend && npm run build",
     
-    "health": "curl -f http://localhost:5051/health && curl -f http://localhost:5052/health",
+    "health": "curl -f http://localhost:5051/health && curl -f http://localhost:8000/health",
     
     "setup:production": "npm run install:all && npm run start",
     "setup:development": "npm run install:all && npm run dev",

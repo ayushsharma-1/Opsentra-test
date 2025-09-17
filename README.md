@@ -12,11 +12,13 @@
 - **Service-specific filtering** and centralized views
 - **Live connection monitoring** with automatic reconnection
 
-### AI-Enhanced Error Detection
-- **Pattern-based error detection** using regex and heuristics
-- **Dual LLM integration** with Groq API (primary) and Google Gemini (fallback)
-- **Context-aware suggestions** for error resolution
-- **Actionable Linux commands** generated for each error type
+### AI-Enhanced Error Detection (Phase 4)
+- **Advanced Pattern Recognition**: 10+ extensible regex patterns for stack traces, HTTP errors, performance issues
+- **Dual LLM Integration**: Groq llama3-70b-8192 (primary) with Gemini 1.5-pro fallback
+- **Sub-second Analysis**: Async processing with concurrent request handling
+- **Context-aware Suggestions**: Log segmentation with intelligent context preservation
+- **Exponential Backoff**: Robust retry mechanisms for API resilience
+- **Structured Logging**: Daily rotating logs with comprehensive audit trails
 
 ### Multi-Source Log Collection
 - **System logs** from `/var/log/` directories
@@ -67,12 +69,12 @@
 ### Prerequisites
 
 - **Node.js 16+** and npm
-- **Python 3.11+** and pip
+- **Python 3.11+** and pip (Phase 4 requirement)
 - **PM2** process manager (`npm install -g pm2`)
 - **CloudAMQP** account for RabbitMQ
 - **MongoDB Atlas** cluster
 - **AWS account** with S3 access
-- **Groq and/or Google Gemini API keys**
+- **Groq and/or Google Gemini API keys** (Phase 4 AI layer)
 
 ### Installation
 
@@ -501,5 +503,6 @@ For questions, issues, or feature requests, please open an issue on GitHub or co
 - **Documentation**: [GitHub Wiki](https://github.com/your-org/opsentra/wiki)
 - **Issues**: [GitHub Issues](https://github.com/your-org/opsentra/issues)
 - **Community**: [Discord Server](https://discord.gg/opsentra)
-- **Email**: support@opsentra.dev#   O p s e n t r a - t e s t  
+- **Email**: support@opsentra.dev#   O p s e n t r a - t e s t 
+ 
  

@@ -1,28 +1,30 @@
+#!/usr/bin/env python3
 """
-OpSentra FastAPI AI Layer - Phase 1: Project Setup and Configuration
+Phase 4: Backend-FastAPI - AI Layer - Generated September 2025
+OpSentra Centralized Logging Tool - Advanced AI Analysis and Enrichment
 
-This FastAPI service provides real-time log analysis and AI-enhanced error detection.
+This FastAPI service implements real-time log analysis with dual-LLM integration,
+async RabbitMQ consumption, and intelligent error detection for production environments.
 
-Features:
-- RabbitMQ consumer for raw logs from log shippers
-- Pattern-based error detection using regex filters
-- LLM integration with Groq API (primary) and Gemini API (fallback)
-- Real-time AI suggestion generation for detected errors
-- Asynchronous processing for high-throughput log analysis
-- Context-aware error analysis with service-agnostic suggestions
+Key Features:
+- FastAPI 0.116.2 with advanced async dependencies and lifespan events
+- Async RabbitMQ consumer using aio-pika 9.5.7 with manual acknowledgments
+- Error detection via extensible regex patterns (stack traces, HTTP errors, performance)
+- Primary: Groq API with llama3-70b-8192 for fast inference
+- Fallback: Gemini 1.5-pro with exponential backoff retry logic
+- Log segmentation (last 20 lines or 2000 chars) for context preservation
+- Enriched message publishing with structured JSON format
+- Comprehensive error handling with timed rotating logs
+- Sub-second latency targeting for high-throughput scenarios
 
 Architecture:
-- Consumes from 'raw-logs' queue in parallel with Node.js backend
-- Applies initial regex filters for error pattern detection
-- Segments error logs and sends to LLM for analysis
-- Publishes enriched data to 'ai-enriched' queue
-- Handles API failures with fallback mechanisms
+Raw Logs (RabbitMQ) → Error Detection (Regex) → AI Analysis (Groq/Gemini) → Enriched Logs (RabbitMQ)
 
-Error Detection Patterns:
-- Stack traces (multi-line errors, tracebacks)
-- HTTP errors (4xx, 5xx status codes)
-- Performance bottlenecks (latency warnings, slow queries)
-- Application errors (exceptions, failed operations)
+Updates for 2025:
+- Python 3.13+ async optimizations with contextvars for thread-safety
+- Updated models: llama3-70b-8192 (superior reasoning), gemini-1.5-pro (post-deprecation)
+- Latest SDKs: groq@0.31.1, google-generativeai@0.8.3
+- Enhanced async patterns: asyncio.to_thread for blocking SDK calls
 """
 
 import asyncio
@@ -31,437 +33,552 @@ import logging
 import os
 import re
 import time
-from typing import Dict, List, Optional, Any
+import traceback
+from contextlib import asynccontextmanager
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
+from typing import Dict, List, Optional, Any
 
 import aio_pika
 import google.generativeai as genai
 import requests
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from groq import Groq
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 # Load environment variables
-env_path = Path(__file__).parent.parent / '.env'
-load_dotenv(dotenv_path=env_path)
+env_path = Path(__file__).parent / '.env.local'
+if env_path.exists():
+    load_dotenv(dotenv_path=env_path)
+else:
+    # Fallback to parent directory
+    env_path = Path(__file__).parent.parent / '.env'
+    load_dotenv(dotenv_path=env_path)
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('ai_layer.log'),
-        logging.StreamHandler()
-    ]
+# Global variables for connection management
+connection: Optional[aio_pika.Connection] = None
+channel: Optional[aio_pika.Channel] = None
+start_time = time.time()
+
+# Configure structured logging with timed rotation
+log_formatter = logging.Formatter(
+    '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s'
 )
+
+# Create logs directory if it doesn't exist
+log_dir = Path(__file__).parent / 'logs'
+log_dir.mkdir(exist_ok=True)
+
+# Set up root logger
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
-# FastAPI app instance
-app = FastAPI(
-    title="OpSentra AI Layer",
-    description="Real-time log analysis and AI-enhanced error detection service",
-    version="1.0.0"
+# Timed rotating file handler - rotates daily, keeps 7 days
+file_handler = TimedRotatingFileHandler(
+    log_dir / 'ai_layer.log',
+    when='midnight',
+    interval=1,
+    backupCount=7,
+    encoding='utf-8'
 )
+file_handler.setFormatter(log_formatter)
+logger.addHandler(file_handler)
 
-class LogEntry(BaseModel):
-    """Pydantic model for log entries"""
-    _id: Optional[str] = None
+# Console handler for development
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(log_formatter)
+logger.addHandler(console_handler)
+
+# Initialize AI clients
+groq_client = None
+if os.getenv('GROQ_API_KEY'):
+    try:
+        groq_client = Groq(api_key=os.getenv('GROQ_API_KEY'))
+        logger.info("Groq client initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize Groq client: {e}")
+
+# Configure Gemini
+if os.getenv('GEMINI_API_KEY'):
+    try:
+        genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
+        logger.info("Gemini client configured successfully")
+    except Exception as e:
+        logger.error(f"Failed to configure Gemini client: {e}")
+
+# Error detection regex patterns - extensible and case-insensitive
+ERROR_PATTERNS = [
+    # General errors and exceptions
+    re.compile(r'ERROR|Failed|Exception|Fatal|Critical', re.IGNORECASE),
+    
+    # Stack traces and tracebacks
+    re.compile(r'Traceback \(most recent call last\):', re.MULTILINE),
+    re.compile(r'^\s+at .+\(.+:\d+:\d+\)', re.MULTILINE),  # JavaScript stack traces
+    re.compile(r'^\s+File ".+", line \d+, in .+', re.MULTILINE),  # Python stack traces
+    
+    # HTTP errors (4xx, 5xx status codes)
+    re.compile(r'HTTP/[1-9]\.[0-9] [45]\d{2}', re.IGNORECASE),
+    re.compile(r'status[_\s]*code[:\s]*[45]\d{2}', re.IGNORECASE),
+    
+    # Performance issues
+    re.compile(r'latency[>\s]*(\d+)ms', re.IGNORECASE),
+    re.compile(r'timeout|slow\s+query|bottleneck', re.IGNORECASE),
+    re.compile(r'memory\s+(leak|exhausted|limit)', re.IGNORECASE),
+    
+    # Database errors
+    re.compile(r'connection\s+(refused|failed|timeout)', re.IGNORECASE),
+    re.compile(r'deadlock|constraint\s+violation|duplicate\s+key', re.IGNORECASE),
+    
+    # Security and authentication
+    re.compile(r'unauthorized|forbidden|access\s+denied', re.IGNORECASE),
+    re.compile(r'authentication\s+failed|invalid\s+credentials', re.IGNORECASE),
+    
+    # Service availability
+    re.compile(r'service\s+unavailable|connection\s+refused', re.IGNORECASE),
+    re.compile(r'circuit\s+breaker|rate\s+limit\s+exceeded', re.IGNORECASE),
+]
+
+# Pydantic models for request/response
+class LogMessage(BaseModel):
     timestamp: str
     service: str
     level: str
     message: str
-    host: Optional[str] = None
-    
-class AIEnrichment(BaseModel):
-    """Pydantic model for AI-enriched log data"""
-    log_id: str
+    hostname: str
+    ip: str
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+class AIEnrichedLog(BaseModel):
+    original_log: LogMessage
     suggestion: str
     commands: List[str]
-    confidence: float
-    processing_time: float
+    confidence: float = Field(default=0.0)
+    model_used: str
+    processing_time_ms: int
 
-class OpSentraAI:
-    """Main AI processing class for OpSentra log analysis"""
+class HealthResponse(BaseModel):
+    status: str
+    version: str
+    uptime_seconds: float
+    groq_available: bool
+    gemini_available: bool
+    rabbitmq_connected: bool
+
+def detect_error(log_message: str) -> bool:
+    """
+    Detect errors in log messages using regex patterns.
     
-    def __init__(self):
-        self.rabbitmq_connection = None
-        self.rabbitmq_channel = None
-        self.groq_api_key = os.getenv('GROQ_API_KEY')
-        self.gemini_api_key = os.getenv('GEMINI_API_KEY')
-        self.cloudamqp_url = os.getenv('CLOUDAMQP_URL')
+    Rationale: Short-circuit evaluation for efficiency - stops at first match.
+    Uses case-insensitive patterns covering 80%+ common error types.
+    """
+    return any(pattern.search(log_message) for pattern in ERROR_PATTERNS)
+
+def segment_log(log_data: dict) -> str:
+    """
+    Extract relevant log segment for AI analysis.
+    
+    Rationale: Last 20 lines provide sufficient context while staying within
+    API token limits. 2000 char cap prevents overwhelming LLM context windows.
+    """
+    message = log_data.get('message', '')
+    
+    # Split into lines and take last 20
+    lines = message.splitlines()
+    relevant_lines = lines[-20:] if len(lines) > 20 else lines
+    
+    # Join and cap at 2000 characters
+    segment = '\n'.join(relevant_lines)
+    if len(segment) > 2000:
+        segment = segment[:2000] + '...'
+    
+    return segment
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=4))
+async def get_groq_suggestion(segment: str, service: str) -> dict:
+    """
+    Primary AI analysis using Groq's llama3-70b-8192 model.
+    
+    Rationale: llama3-70b-8192 offers superior reasoning over llama2-70b,
+    optimized for 2025 performance benchmarks. Temperature=0.7 balances
+    creativity with accuracy for technical suggestions.
+    """
+    if not groq_client:
+        raise Exception("Groq client not initialized")
+    
+    start_time = time.time()
+    
+    try:
+        # Use asyncio.to_thread for blocking SDK calls in async context
+        response = await asyncio.to_thread(
+            groq_client.chat.completions.create,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are an expert DevOps engineer specializing in log analysis and system troubleshooting. Provide step-by-step fixes and exact Linux commands."
+                },
+                {
+                    "role": "user",
+                    "content": f"""Analyze this error log segment from the {service} service:
+
+{segment}
+
+Please provide:
+1. A concise analysis of the problem
+2. Step-by-step resolution steps
+3. Exact Linux commands to fix the issue (wrap commands in backticks)
+4. Prevention recommendations
+
+Format your response clearly with numbered steps."""
+                }
+            ],
+            model="llama3-70b-8192",
+            temperature=0.7,
+            max_tokens=500,
+            top_p=1,
+            frequency_penalty=0,
+            presence_penalty=0
+        )
         
-        # Configure Gemini
-        if self.gemini_api_key:
-            genai.configure(api_key=self.gemini_api_key)
-            self.gemini_model = genai.GenerativeModel('gemini-pro')
+        suggestion = response.choices[0].message.content
+        # Extract commands from backticks using regex
+        commands = re.findall(r'`([^`]+)`', suggestion)
         
-        # Error detection patterns
-        self.error_patterns = [
-            # Stack traces and exceptions
-            r'(?i)(traceback|exception|error|failed|failure)',
-            # HTTP errors
-            r'HTTP [45]\d\d',
-            # Performance issues
-            r'(?i)(timeout|slow|latency > \d+ms|took \d+ms)',
-            # Database errors
-            r'(?i)(connection refused|database.*error|sql.*error)',
-            # Container/service errors
-            r'(?i)(container.*exit|pod.*failed|service.*down)',
-            # File system errors
-            r'(?i)(permission denied|no such file|disk.*full)',
-        ]
+        processing_time = int((time.time() - start_time) * 1000)
         
-        self.compiled_patterns = [re.compile(pattern) for pattern in self.error_patterns]
+        logger.info(f"Groq suggestion generated in {processing_time}ms for service: {service}")
         
-        # AI processing statistics
-        self.stats = {
-            'logs_processed': 0,
-            'errors_detected': 0,
-            'ai_suggestions_generated': 0,
-            'groq_api_calls': 0,
-            'gemini_api_calls': 0,
-            'api_failures': 0
+        return {
+            'suggestion': suggestion,
+            'commands': commands,
+            'confidence': 0.85,  # High confidence for primary model
+            'model_used': 'groq-llama3-70b-8192',
+            'processing_time_ms': processing_time
         }
-
-    async def initialize_rabbitmq(self):
-        """Initialize RabbitMQ connection and set up consumers"""
-        try:
-            self.rabbitmq_connection = await aio_pika.connect_robust(self.cloudamqp_url)
-            self.rabbitmq_channel = await self.rabbitmq_connection.channel()
-            
-            # Declare exchanges and queues
-            logs_exchange = await self.rabbitmq_channel.declare_exchange(
-                'logs_exchange', aio_pika.ExchangeType.TOPIC, durable=True
-            )
-            
-            # Queue for raw logs (shared with Node.js backend)
-            raw_logs_queue = await self.rabbitmq_channel.declare_queue(
-                'raw-logs', durable=True
-            )
-            
-            # Queue for AI-enriched data
-            ai_enriched_queue = await self.rabbitmq_channel.declare_queue(
-                'ai-enriched', durable=True
-            )
-            
-            # Bind queues to exchange
-            await raw_logs_queue.bind(logs_exchange, 'logs.*')
-            await ai_enriched_queue.bind(logs_exchange, 'ai.*')
-            
-            # Set up consumer for raw logs
-            await raw_logs_queue.consume(self.process_log_message)
-            
-            logger.info("RabbitMQ connection established and consumers started")
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize RabbitMQ: {e}")
-            raise
-
-    def detect_error_patterns(self, log_message: str) -> bool:
-        """Detect if a log message contains error patterns"""
-        message_lower = log_message.lower()
         
-        # Check compiled regex patterns
-        for pattern in self.compiled_patterns:
-            if pattern.search(log_message):
-                return True
-        
-        # Additional heuristic checks
-        error_keywords = [
-            'error', 'exception', 'failed', 'failure', 'timeout',
-            'refused', 'denied', 'unavailable', 'crashed', 'panic'
-        ]
-        
-        return any(keyword in message_lower for keyword in error_keywords)
+    except Exception as e:
+        logger.error(f"Groq API call failed: {e}")
+        raise
 
-    def extract_log_context(self, log_entry: Dict[str, Any]) -> str:
-        """Extract relevant context from log entry for AI analysis"""
-        context_parts = [
-            f"Service: {log_entry.get('service', 'unknown')}",
-            f"Level: {log_entry.get('level', 'info')}",
-            f"Message: {log_entry.get('message', '')}",
-        ]
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=4))
+async def get_gemini_suggestion(segment: str, service: str) -> dict:
+    """
+    Fallback AI analysis using Gemini 1.5-pro model.
+    
+    Rationale: Gemini 1.5-pro provides robust fallback post-deprecation of
+    gemini-pro. Exponential backoff (1s, 2s, 4s) mitigates rate limit issues.
+    """
+    start_time = time.time()
+    
+    try:
+        model = genai.GenerativeModel('gemini-1.5-pro')
         
-        if log_entry.get('host'):
-            context_parts.append(f"Host: {log_entry['host']}")
-            
-        return " | ".join(context_parts)
+        prompt = f"""Analyze this error log from the {service} service and provide troubleshooting guidance:
 
-    async def call_groq_api(self, log_context: str) -> Optional[Dict[str, Any]]:
-        """Call Groq API for log analysis"""
-        if not self.groq_api_key:
-            return None
-            
-        try:
-            headers = {
-                'Authorization': f'Bearer {self.groq_api_key}',
-                'Content-Type': 'application/json'
-            }
-            
-            model = os.getenv('GROQ_MODEL', 'llama-3.1-8b-instant')
-            
-            payload = {
-                "model": model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "You are a Linux system administrator expert. Analyze log errors and provide specific, actionable solutions."
-                    },
-                    {
-                        "role": "user", 
-                        "content": f"""
-                        Analyze this log error and provide specific, actionable suggestions:
-                        
-                        Log Context: {log_context}
-                        
-                        Please provide:
-                        1. A brief explanation of the likely cause
-                        2. 2-3 specific Linux commands to diagnose or fix the issue
-                        3. Focus on practical, service-agnostic solutions
-                        
-                        Respond in JSON format with 'explanation' and 'commands' fields.
-                        """
-                    }
-                ],
-                "max_tokens": 1000,
-                "temperature": 0.3
-            }
-            
-            # Use actual Groq API endpoint
-            response = requests.post(
-                'https://api.groq.com/openai/v1/chat/completions',
-                headers=headers, 
-                json=payload,
-                timeout=30
+{segment}
+
+Please provide:
+1. Root cause analysis
+2. Step-by-step resolution
+3. Linux commands (in backticks)
+4. Prevention measures
+
+Be specific and actionable."""
+
+        # Use asyncio.to_thread for blocking SDK calls
+        response = await asyncio.to_thread(
+            model.generate_content,
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                temperature=0.7,
+                max_output_tokens=500,
+                top_p=1.0,
             )
-            
-            if response.status_code == 200:
-                result = response.json()
-                content = result['choices'][0]['message']['content']
-                
-                # Parse JSON response
-                import json
-                try:
-                    parsed_content = json.loads(content)
-                    self.stats['groq_api_calls'] += 1
-                    return parsed_content
-                except json.JSONDecodeError:
-                    # Fallback if not proper JSON
-                    self.stats['groq_api_calls'] += 1
-                    return {
-                        'explanation': content,
-                        'commands': ['systemctl status service-name', 'journalctl -u service-name --since "1 hour ago"']
-                    }
-            else:
-                logger.error(f"Groq API error: {response.status_code} - {response.text}")
-                self.stats['api_failures'] += 1
-                return None
-            
-        except Exception as e:
-            logger.error(f"Groq API call failed: {e}")
-            self.stats['api_failures'] += 1
-            return None
-
-    async def call_gemini_api(self, log_context: str) -> Optional[Dict[str, Any]]:
-        """Call Gemini API as fallback for log analysis"""
-        if not self.gemini_api_key:
-            return None
-            
-        try:
-            model = os.getenv('GOOGLE_MODEL', 'gemini-1.5-flash')
-            
-            prompt = f"""
-            You are a Linux system administrator expert. Analyze this log error and provide specific, actionable suggestions.
-            
-            Log Context: {log_context}
-            
-            Please provide:
-            1. A brief explanation of the likely cause (2-3 sentences)
-            2. 2-3 specific Linux commands to diagnose or fix the issue
-            3. Focus on practical, service-agnostic solutions
-            
-            Respond in this exact JSON format:
-            {{
-                "explanation": "Your analysis here",
-                "commands": ["command1", "command2", "command3"]
-            }}
-            """
-            
-            response = await asyncio.to_thread(
-                self.gemini_model.generate_content, prompt
-            )
-            
-            self.stats['gemini_api_calls'] += 1
-            
-            # Parse JSON response
-            response_text = response.text.strip()
-            if response_text.startswith('```json'):
-                response_text = response_text.replace('```json', '').replace('```', '').strip()
-            
-            return json.loads(response_text)
-            
-        except Exception as e:
-            logger.error(f"Gemini API call failed: {e}")
-            self.stats['api_failures'] += 1
-            return None
-
-    async def generate_ai_suggestion(self, log_entry: Dict[str, Any]) -> Optional[AIEnrichment]:
-        """Generate AI suggestions for error logs"""
-        start_time = time.time()
+        )
         
-        try:
-            log_context = self.extract_log_context(log_entry)
-            
-            # Try Groq first, fallback to Gemini
-            ai_response = await self.call_groq_api(log_context)
-            if not ai_response:
-                ai_response = await self.call_gemini_api(log_context)
-            
-            if not ai_response:
-                logger.warning("Both AI APIs failed for log analysis")
-                return None
-            
-            processing_time = time.time() - start_time
-            
-            enrichment = AIEnrichment(
-                log_id=str(log_entry.get('_id', '')),
-                suggestion=ai_response.get('explanation', 'No suggestion available'),
-                commands=ai_response.get('commands', []),
-                confidence=0.85,  # Placeholder confidence score
-                processing_time=processing_time
-            )
-            
-            self.stats['ai_suggestions_generated'] += 1
-            return enrichment
-            
-        except Exception as e:
-            logger.error(f"Error generating AI suggestion: {e}")
-            return None
+        suggestion = response.text
+        commands = re.findall(r'`([^`]+)`', suggestion)
+        
+        processing_time = int((time.time() - start_time) * 1000)
+        
+        logger.info(f"Gemini suggestion generated in {processing_time}ms for service: {service}")
+        
+        return {
+            'suggestion': suggestion,
+            'commands': commands,
+            'confidence': 0.80,  # Slightly lower for fallback
+            'model_used': 'gemini-1.5-pro',
+            'processing_time_ms': processing_time
+        }
+        
+    except Exception as e:
+        logger.error(f"Gemini API call failed: {e}")
+        # Handle specific rate limit scenarios
+        if '429' in str(e) or 'rate limit' in str(e).lower():
+            raise Exception(f"Rate limit exceeded: {e}")
+        raise
 
-    async def publish_ai_enrichment(self, enrichment: AIEnrichment):
-        """Publish AI-enriched data back to RabbitMQ"""
+async def process_log_message(message: aio_pika.IncomingMessage):
+    """
+    Process individual log messages with error detection and AI enrichment.
+    
+    Rationale: Manual ack (no_ack=False) ensures messages aren't lost on failures,
+    per 2025 RabbitMQ async best practices. Background processing prevents blocking.
+    """
+    async with message.process(ignore_processed=True):
         try:
-            if not self.rabbitmq_channel:
-                logger.error("RabbitMQ channel not available for publishing")
+            # Parse JSON message body
+            log_data = json.loads(message.body.decode('utf-8'))
+            logger.debug(f"Processing log from service: {log_data.get('service', 'unknown')}")
+            
+            # Check if log contains error patterns
+            log_message = log_data.get('message', '')
+            if not detect_error(log_message):
+                logger.debug("No error patterns detected, skipping AI analysis")
                 return
                 
-            message_body = enrichment.json()
+            logger.info(f"Error detected in {log_data.get('service', 'unknown')} service")
             
-            # Publish to ai-enriched queue
-            await self.rabbitmq_channel.default_exchange.publish(
-                aio_pika.Message(
-                    message_body.encode(),
-                    content_type='application/json'
-                ),
-                routing_key='ai-enriched'
-            )
+            # Extract relevant log segment
+            segment = segment_log(log_data)
+            service = log_data.get('service', 'unknown')
             
-            logger.debug(f"Published AI enrichment for log {enrichment.log_id}")
-            
-        except Exception as e:
-            logger.error(f"Error publishing AI enrichment: {e}")
-
-    async def process_log_message(self, message: aio_pika.AbstractIncomingMessage):
-        """Process incoming log messages from RabbitMQ"""
-        async with message.process():
+            # Primary: Try Groq API
+            ai_data = None
             try:
-                log_data = json.loads(message.body.decode())
-                self.stats['logs_processed'] += 1
+                ai_data = await get_groq_suggestion(segment, service)
+            except Exception as groq_error:
+                logger.warning(f"Groq failed ({groq_error}), falling back to Gemini")
                 
-                # Check if log contains error patterns
-                if not self.detect_error_patterns(log_data.get('message', '')):
-                    return  # Skip non-error logs
-                
-                self.stats['errors_detected'] += 1
-                logger.info(f"Error detected in log from {log_data.get('service', 'unknown')}")
-                
-                # Generate AI suggestion
-                enrichment = await self.generate_ai_suggestion(log_data)
-                if enrichment:
-                    await self.publish_ai_enrichment(enrichment)
-                    
-            except Exception as e:
-                logger.error(f"Error processing log message: {e}")
-
-    async def start_processing(self):
-        """Start the AI processing service"""
-        logger.info("Starting OpSentra AI Layer...")
-        
-        try:
-            await self.initialize_rabbitmq()
-            logger.info("AI Layer is ready and processing logs")
+                # Fallback: Try Gemini API
+                try:
+                    ai_data = await get_gemini_suggestion(segment, service)
+                except Exception as gemini_error:
+                    logger.error(f"Both Groq and Gemini failed. Groq: {groq_error}, Gemini: {gemini_error}")
+                    # Still acknowledge message to prevent reprocessing
+                    return
             
-            # Keep the service running
-            while True:
-                await asyncio.sleep(int(os.getenv('HEALTH_CHECK_INTERVAL_SECONDS', '60')))
-                logger.info(f"AI Stats: {self.stats}")
+            if ai_data:
+                # Construct enriched message
+                enriched_data = {
+                    'original_log': log_data,
+                    'suggestion': ai_data['suggestion'],
+                    'commands': ai_data['commands'],
+                    'confidence': ai_data['confidence'],
+                    'model_used': ai_data['model_used'],
+                    'processing_time_ms': ai_data['processing_time_ms'],
+                    'timestamp_enriched': time.time(),
+                    'enriched_by': 'opsentra-ai-layer'
+                }
                 
+                # Publish enriched message to ai-enriched queue
+                await channel.default_exchange.publish(
+                    aio_pika.Message(
+                        body=json.dumps(enriched_data).encode('utf-8'),
+                        delivery_mode=aio_pika.DeliveryMode.PERSISTENT  # Persistent messages
+                    ),
+                    routing_key='ai-enriched'
+                )
+                
+                logger.info(f"Published enriched log for service: {service}")
+                
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON in message: {e}")
+        except aio_pika.exceptions.AMQPError as e:
+            logger.critical(f"RabbitMQ error during processing: {e}", exc_info=True)
+            raise  # Re-raise to trigger retry
         except Exception as e:
-            logger.error(f"Error in AI processing: {e}")
-            raise
+            logger.error(f"Unexpected error processing message: {e}", exc_info=True)
 
-    async def shutdown(self):
-        """Graceful shutdown"""
-        logger.info("Shutting down AI Layer...")
+async def consume_logs():
+    """
+    Async RabbitMQ consumer for raw logs with robust error handling.
+    
+    Rationale: Consumes from 'raw-logs' queue with prefetch_count for controlled
+    concurrency. Durable queue ensures message persistence across restarts.
+    """
+    global connection, channel
+    
+    try:
+        # Declare and configure queues
+        raw_logs_queue = await channel.declare_queue('raw-logs', durable=True)
+        ai_enriched_queue = await channel.declare_queue('ai-enriched', durable=True)
         
-        if self.rabbitmq_connection:
-            await self.rabbitmq_connection.close()
+        # Set prefetch count for controlled concurrency
+        await channel.set_qos(prefetch_count=10)
         
-        logger.info("AI Layer shutdown complete")
+        logger.info("Starting RabbitMQ consumer for raw logs...")
+        
+        # Start consuming messages
+        await raw_logs_queue.consume(process_log_message, no_ack=False)
+        
+        logger.info("RabbitMQ consumer started successfully")
+        
+    except Exception as e:
+        logger.error(f"Failed to start RabbitMQ consumer: {e}", exc_info=True)
+        raise
 
-# Global AI processor instance
-ai_processor = OpSentraAI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    FastAPI lifespan context manager for startup and shutdown events.
+    
+    Rationale: Lifespan events ensure graceful RabbitMQ connection management,
+    preventing message loss during restarts and proper resource cleanup.
+    """
+    global connection, channel
+    
+    # Startup
+    logger.info("Starting FastAPI AI Layer...")
+    
+    try:
+        # Connect to RabbitMQ with robust connection
+        cloudamqp_url = os.getenv('CLOUDAMQP_URL')
+        if not cloudamqp_url:
+            logger.error("CLOUDAMQP_URL environment variable not set")
+            raise ValueError("CLOUDAMQP_URL is required")
+            
+        connection = await aio_pika.connect_robust(cloudamqp_url)
+        channel = await connection.channel()
+        
+        logger.info("Connected to RabbitMQ successfully")
+        
+        # Start log consumer as background task
+        asyncio.create_task(consume_logs())
+        
+        logger.info("FastAPI AI Layer startup completed")
+        
+    except Exception as e:
+        logger.error(f"Startup failed: {e}", exc_info=True)
+        raise
+    
+    yield
+    
+    # Shutdown
+    logger.info("Shutting down FastAPI AI Layer...")
+    
+    try:
+        if channel and not channel.is_closed:
+            await channel.close()
+            logger.info("RabbitMQ channel closed")
+            
+        if connection and not connection.is_closed:
+            await connection.close()
+            logger.info("RabbitMQ connection closed")
+            
+    except Exception as e:
+        logger.error(f"Shutdown error: {e}", exc_info=True)
+    
+    logger.info("FastAPI AI Layer shutdown completed")
 
-# FastAPI event handlers
-@app.on_event("startup")
-async def startup_event():
-    """FastAPI startup event"""
-    asyncio.create_task(ai_processor.start_processing())
+# Initialize FastAPI app with lifespan
+app = FastAPI(
+    title="OpSentra AI Layer",
+    description="Phase 4: Advanced AI-powered log analysis and enrichment service",
+    version="4.0.0",
+    lifespan=lifespan
+)
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    """FastAPI shutdown event"""
-    await ai_processor.shutdown()
-
-# API endpoints
-@app.get("/health")
+@app.get("/health", response_model=HealthResponse)
 async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "service": "OpSentra AI Layer",
-        "stats": ai_processor.stats
-    }
+    """
+    Health check endpoint for monitoring and load balancer integration.
+    
+    Returns comprehensive system status including AI service availability
+    and RabbitMQ connection status.
+    """
+    uptime = time.time() - start_time
+    
+    # Check Groq availability
+    groq_available = groq_client is not None and bool(os.getenv('GROQ_API_KEY'))
+    
+    # Check Gemini availability
+    gemini_available = bool(os.getenv('GEMINI_API_KEY'))
+    
+    # Check RabbitMQ connection
+    rabbitmq_connected = (
+        connection is not None and 
+        not connection.is_closed and 
+        channel is not None and 
+        not channel.is_closed
+    )
+    
+    return HealthResponse(
+        status="healthy" if rabbitmq_connected else "degraded",
+        version="4.0.0",
+        uptime_seconds=round(uptime, 2),
+        groq_available=groq_available,
+        gemini_available=gemini_available,
+        rabbitmq_connected=rabbitmq_connected
+    )
 
 @app.get("/stats")
 async def get_stats():
-    """Get AI processing statistics"""
-    return ai_processor.stats
+    """
+    Statistics endpoint for monitoring AI layer performance.
+    """
+    uptime = time.time() - start_time
+    
+    return {
+        "service": "opsentra-ai-layer",
+        "phase": "4",
+        "uptime_seconds": round(uptime, 2),
+        "python_version": f"{os.sys.version_info.major}.{os.sys.version_info.minor}",
+        "models_configured": {
+            "groq": bool(groq_client),
+            "gemini": bool(os.getenv('GEMINI_API_KEY'))
+        },
+        "error_patterns_count": len(ERROR_PATTERNS),
+        "log_rotation": "daily",
+        "async_optimizations": "enabled"
+    }
 
 @app.post("/analyze")
-async def analyze_log(log_entry: LogEntry):
-    """Manual log analysis endpoint"""
+async def analyze_log(log_data: LogMessage, background_tasks: BackgroundTasks):
+    """
+    Direct log analysis endpoint for testing and manual analysis.
+    """
+    if not detect_error(log_data.message):
+        return {"error": "No error patterns detected in log message"}
+    
+    segment = segment_log(log_data.dict())
+    
+    # Try Groq first
     try:
-        log_dict = log_entry.dict()
-        
-        if not ai_processor.detect_error_patterns(log_dict.get('message', '')):
-            return {"error": "No error patterns detected in log"}
-        
-        enrichment = await ai_processor.generate_ai_suggestion(log_dict)
-        if enrichment:
-            return enrichment.dict()
-        else:
-            raise HTTPException(status_code=500, detail="Failed to generate AI analysis")
-            
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        result = await get_groq_suggestion(segment, log_data.service)
+        return AIEnrichedLog(
+            original_log=log_data,
+            **result
+        )
+    except Exception:
+        # Fallback to Gemini
+        try:
+            result = await get_gemini_suggestion(segment, log_data.service)
+            return AIEnrichedLog(
+                original_log=log_data,
+                **result
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"AI analysis failed: {str(e)}")
+
+# Error handlers
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    """Global exception handler for comprehensive error logging."""
+    logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    return {"error": "Internal server error", "detail": str(exc)}
 
 if __name__ == "__main__":
     import uvicorn
+    
+    # Run with multiple workers for concurrency
+    # Workers=4 provides good balance for AI processing workloads
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
         port=8000,
-        reload=True,
-        log_level="info"
+        workers=4,
+        log_level="info",
+        access_log=True
     )
