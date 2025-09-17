@@ -39,7 +39,7 @@ import {
 
 // Import theme and hooks
 import { opsentraTheme, getStatusColor } from './theme/theme';
-import { useSSE } from './hooks/useSSE';
+import useSSE from './hooks/useSSE';
 
 // Lazy load components for code splitting
 const ServiceTab = React.lazy(() => import('./components/ServiceTab'));

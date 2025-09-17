@@ -68,14 +68,13 @@ module.exports = {
     {
       // FastAPI AI Layer
       name: 'opsentra-backend-fastapi',
-      script: 'uvicorn',
+      script: './backend-fastapi/venv/bin/uvicorn',
       args: [
         'main:app',
         '--host', '0.0.0.0', 
         '--port', '8000'
       ],
       cwd: './backend-fastapi',
-      interpreter: 'python3',
       instances: 1,
       exec_mode: 'fork',
       

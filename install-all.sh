@@ -107,8 +107,17 @@ install_frontend() {
         
         if [ -f package.json ]; then
             print_info "Installing React + Vite dependencies..."
-            npm install
-            print_success "Frontend dependencies installed successfully"
+            if npm install; then
+                print_success "Frontend dependencies installed successfully"
+            else
+                print_warning "Regular npm install failed, trying with --legacy-peer-deps..."
+                if npm install --legacy-peer-deps; then
+                    print_success "Frontend dependencies installed successfully with legacy peer deps"
+                else
+                    print_error "Failed to install frontend dependencies even with --legacy-peer-deps"
+                    exit 1
+                fi
+            fi
             
             # Build frontend for production
             print_info "Building React app for production..."
@@ -135,9 +144,19 @@ install_backend_node() {
         
         if [ -f package.json ]; then
             print_info "Installing Node.js backend dependencies..."
-            print_info "Including: express@5.1.0, mongodb@6.19.0, amqplib@0.10.9, @aws-sdk/client-s3@3.890.0"
-            npm install
-            print_success "Backend-Node dependencies installed successfully"
+            print_info "Including: express@4.19.2, mongodb@6.3.0, amqplib@0.10.3, @aws-sdk/client-s3@3.520.0"
+            
+            if npm install; then
+                print_success "Backend-Node dependencies installed successfully"
+            else
+                print_warning "Regular npm install failed, trying with --legacy-peer-deps..."
+                if npm install --legacy-peer-deps; then
+                    print_success "Backend-Node dependencies installed successfully with legacy peer deps"
+                else
+                    print_error "Failed to install backend-node dependencies"
+                    exit 1
+                fi
+            fi
             
             # Verify critical dependencies
             if npm list express > /dev/null 2>&1; then
@@ -174,13 +193,39 @@ install_backend_fastapi() {
         cd backend-fastapi
         
         if [ -f requirements.txt ]; then
-            if command -v pip3 &> /dev/null; then
+            if command -v python3 &> /dev/null; then
                 print_info "Installing Python FastAPI dependencies..."
-                pip3 install -r requirements.txt
-                print_success "Backend-FastAPI dependencies installed successfully"
+                
+                # Create virtual environment if it doesn't exist
+                if [ ! -d "venv" ]; then
+                    print_info "Creating Python virtual environment..."
+                    python3 -m venv venv
+                fi
+                
+                # Activate virtual environment and install dependencies
+                print_info "Activating virtual environment and installing packages..."
+                source venv/bin/activate
+                pip install --upgrade pip
+                pip install -r requirements.txt
+                
+                print_success "Backend-FastAPI dependencies installed successfully in virtual environment"
+                
+                # Create activation script for easy use
+                cat > activate_venv.sh << 'EOF'
+#!/bin/bash
+# OpSentra FastAPI Virtual Environment Activation
+cd "$(dirname "$0")"
+source venv/bin/activate
+echo "✓ FastAPI virtual environment activated"
+echo "Run 'deactivate' to exit the virtual environment"
+EOF
+                chmod +x activate_venv.sh
+                print_info "Created activate_venv.sh script for easy virtual environment activation"
+                
             else
-                print_error "pip3 not found. Cannot install Python dependencies."
-                print_info "Please install Python 3.9+ and pip3, then run: pip3 install -r backend-fastapi/requirements.txt"
+                print_error "python3 not found. Cannot install Python dependencies."
+                print_info "Please install Python 3.9+ and pip3"
+                exit 1
             fi
         else
             print_error "backend-fastapi/requirements.txt not found"
