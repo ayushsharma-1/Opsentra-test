@@ -1,0 +1,62 @@
+{
+  "name": "opsentra",
+  "version": "1.0.0",
+  "description": "OpSentra Centralized Logging Tool - AI-Enhanced Real-time Log Aggregation System",
+  "main": "index.js",
+  "scripts": {
+    "install:all": "npm run install:frontend && npm run install:backend-node && npm run install:backend-fastapi && npm run install:backend-service",
+    "install:frontend": "cd frontend && npm install",
+    "install:backend-node": "cd backend-node && npm install",
+    "install:backend-fastapi": "cd backend-fastapi && pip install -r requirements.txt",
+    "install:backend-service": "cd backend-service && npm install",
+    
+    "dev": "pm2 start ecosystem.config.js --env development",
+    "start": "pm2 start ecosystem.config.js --env production",
+    "stop": "pm2 stop all",
+    "restart": "pm2 restart all",
+    "delete": "pm2 delete all",
+    "status": "pm2 status",
+    "logs": "pm2 logs",
+    "monit": "pm2 monit",
+    
+    "dev:frontend": "cd frontend && npm run dev",
+    "dev:backend-node": "cd backend-node && npm run dev",
+    "dev:backend-fastapi": "cd backend-fastapi && uvicorn main:app --host 0.0.0.0 --port 5052 --reload",
+    "dev:backend-service": "cd backend-service && npm start",
+    
+    "build": "npm run build:frontend",
+    "build:frontend": "cd frontend && npm run build",
+    
+    "health": "curl -f http://localhost:5051/health && curl -f http://localhost:5052/health",
+    
+    "setup:production": "npm run install:all && npm run start",
+    "setup:development": "npm run install:all && npm run dev",
+    "setup": "npm run install:all"
+  },
+  "keywords": [
+    "logging",
+    "monitoring",
+    "real-time",
+    "ai",
+    "rabbitmq",
+    "mongodb",
+    "aws",
+    "distributed"
+  ],
+  "author": "OpSentra Team",
+  "license": "MIT",
+  "devDependencies": {
+    "pm2": "^5.3.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/your-org/opsentra.git"
+  },
+  "bugs": {
+    "url": "https://github.com/your-org/opsentra/issues"
+  },
+  "homepage": "https://github.com/your-org/opsentra#readme"
+}

@@ -1,0 +1,38 @@
+{
+  "name": "opsentra-log-shipper",
+  "version": "2.0.0",
+  "description": "OpSentra Log Shipper - Enhanced Distributed Log Collection Agent for Linux Services - Phase 2",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "node index.js --test-log 'Sample error'",
+    "install-service": "bash install.sh",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "@sematext/logagent": "^3.3.1",
+    "amqplib": "^0.10.9",
+    "pino": "^9.9.5",
+    "@aws-sdk/client-s3": "^3.890.0",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "keywords": [
+    "logging",
+    "shipper",
+    "log-collection",
+    "rabbitmq",
+    "linux",
+    "monitoring"
+  ],
+  "author": "OpSentra Team",
+  "license": "MIT",
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "os": [
+    "linux"
+  ]
+}
